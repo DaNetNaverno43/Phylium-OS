@@ -18,8 +18,10 @@ var (
 	LocalDbPath      string
 	ManifestsDir     string
 	SyncDir          string
-	TargetPrefix     string // Root prefix destination for extraction (~/.local/share/pbb/root)
-	BinSymlinkDir    string // Global environment location for binary mapping (~/.local/bin)
+	TargetPrefix     string // Root prefix for official repo packages (~/.local/share/pbb/root)
+	AurTargetPrefix  string // Root prefix for AUR packages (~/.local/share/pbb/aur-root)
+	BinSymlinkDir    string // Symlink dir for official repo binaries (~/.local/bin)
+	AurBinSymlinkDir string // Symlink dir for AUR binaries (~/.local/bin/aur)
 )
 
 const (
@@ -33,10 +35,12 @@ type PbbState struct {
 	LastUpdated     time.Time `json:"last_updated"`
 }
 
+// PackageInfo tracks an installed package. Source is "repo" or "aur".
 type PackageInfo struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 	Branch  string `json:"branch"`
+	Source  string `json:"source"`
 }
 
 type AurPackage struct {
@@ -52,30 +56,28 @@ type AurResponse struct {
 }
 
 var verbose bool
-type typeStringList = string
 
 func init() {
-	// Locate system configuration user directory
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("[pbb] Critical error: failed to determine user home directory: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Establish local storage structure inside paths variables
-	BasePbbDir = filepath.Join(home, ".local", "share", "pbb")
-	PbbDir = filepath.Join(BasePbbDir, "system") 
-	TargetPrefix = filepath.Join(BasePbbDir, "root") 
-	BinSymlinkDir = filepath.Join(home, ".local", "bin") 
+	BasePbbDir       = filepath.Join(home, ".local", "share", "pbb")
+	PbbDir           = filepath.Join(BasePbbDir, "system")
+	TargetPrefix     = filepath.Join(BasePbbDir, "root")
+	AurTargetPrefix  = filepath.Join(BasePbbDir, "aur-root")
+	BinSymlinkDir    = filepath.Join(home, ".local", "bin")
+	AurBinSymlinkDir = filepath.Join(home, ".local", "bin", "aur")
 
 	StateFilePath = filepath.Join(PbbDir, "state.json")
-	LocalDbPath = filepath.Join(PbbDir, "local_db.json")
-	ManifestsDir = filepath.Join(PbbDir, "manifests")
-	SyncDir = filepath.Join(PbbDir, "sync")
+	LocalDbPath   = filepath.Join(PbbDir, "local_db.json")
+	ManifestsDir  = filepath.Join(PbbDir, "manifests")
+	SyncDir       = filepath.Join(PbbDir, "sync")
 }
 
 func main() {
-	// Verify that the patchelf executable is present in host environment
 	if _, err := exec.LookPath("patchelf"); err != nil {
 		fmt.Println("[pbb] Error: executable utility 'patchelf' not found on the host system!")
 		fmt.Println("       Please install it using your system package manager (e.g.: sudo xbps-install -S patchelf)")
@@ -97,20 +99,15 @@ func main() {
 	var bleedingOpt bool
 	var rollbackOpt bool
 	var verboseOpt bool
-	var packages []typeStringList
+	var packages []string
 
-	if action == "-S" || action == "-R" || action == "-Q" || !strings.HasPrefix(action, "-") {
-		fs := flag.NewFlagSet("pbb", flag.ExitOnError)
-		fs.BoolVar(&bleedingOpt, "bleeding", false, "Enable tracking of bleeding edge branch components")
-		fs.BoolVar(&rollbackOpt, "rollback", false, "Rollback tracked packages down from bleeding edge to stable")
-		fs.BoolVar(&verboseOpt, "v", false, "Enable verbose troubleshooting log output")
-		
-		fs.Parse(os.Args[2:])
-		packages = fs.Args()
-		verbose = verboseOpt
-	} else {
-		packages = os.Args[2:]
-	}
+	fs := flag.NewFlagSet("pbb", flag.ExitOnError)
+	fs.BoolVar(&bleedingOpt, "bleeding", false, "Enable tracking of bleeding edge branch components")
+	fs.BoolVar(&rollbackOpt, "rollback", false, "Rollback package from bleeding edge to stable")
+	fs.BoolVar(&verboseOpt, "v", false, "Enable verbose troubleshooting log output")
+	fs.Parse(os.Args[2:])
+	packages = fs.Args()
+	verbose = verboseOpt
 
 	stableSnapshot, err := GetOrUpdateSnapshot()
 	if err != nil {
@@ -126,6 +123,18 @@ func main() {
 		branchName = "bleeding"
 	}
 
+	// --rollback can accompany any action; handle it first
+	if rollbackOpt {
+		if len(packages) == 0 {
+			fmt.Println("[pbb] Error: Missing rollback target package name.")
+			os.Exit(1)
+		}
+		for _, pkg := range packages {
+			handleRollback(pkg, stableMirror)
+		}
+		return
+	}
+
 	switch action {
 	case "-Syu":
 		fmt.Println("[pbb] Synchronizing package repository databases...")
@@ -136,7 +145,7 @@ func main() {
 			localDbTarget := filepath.Join(SyncDir, repo+".db")
 
 			if verbose {
-				fmt.Printf("[v] Querying remote repository database database index %s: %s\n", repo, dbURL)
+				fmt.Printf("[v] Querying remote repository database index %s: %s\n", repo, dbURL)
 			}
 
 			if err := downloadFile(dbURL, localDbTarget); err != nil {
@@ -154,7 +163,7 @@ func main() {
 
 		for _, pkgName := range packages {
 			if strings.HasSuffix(pkgName, ".pkg.tar.zst") {
-				pkgName = strings.Split(pkgName, "-")[0]
+				pkgName = parsePkgNameFromFilename(pkgName)
 			}
 
 			fmt.Printf("[pbb] Searching for package '%s' in repository indexes...\n", pkgName)
@@ -165,175 +174,167 @@ func main() {
 			}
 
 			if verbose {
-				fmt.Printf("[v] Repository hit: %s | Extracted filename: %s | Target version: %s\n", repoType, pkgFilename, pkgVersion)
+				fmt.Printf("[v] Repository hit: %s | Filename: %s | Version: %s\n", repoType, pkgFilename, pkgVersion)
 			}
 
 			url := fmt.Sprintf("%s/%s/os/x86_64/%s", currentMirror, repoType, pkgFilename)
-			fmt.Printf("[pbb] Downloading target component '%s' from [%s]...\n", pkgName, repoType)
+			fmt.Printf("[pbb] Downloading '%s' from [%s]...\n", pkgName, repoType)
 
 			tmpFile := filepath.Join("/tmp", pkgFilename)
 			if err := downloadFile(url, tmpFile); err != nil {
-				fmt.Printf("[pbb] Download process halted: %v\n", err)
+				fmt.Printf("[pbb] Download failed: %v\n", err)
 				continue
 			}
 
 			if verbose {
-				fmt.Printf("[v] Unpacking payload file %s into targeted system prefix environment: %s...\n", pkgFilename, TargetPrefix)
+				fmt.Printf("[v] Extracting %s into %s...\n", pkgFilename, TargetPrefix)
 			}
-			
-			manifest, err := extractZstTar(tmpFile, TargetPrefix)
+
+			manifest, err := extractZstTar(tmpFile, TargetPrefix, BinSymlinkDir)
 			if err != nil {
-				fmt.Printf("[pbb] Prefix system environment layout manipulation error: %v\n", err)
+				fmt.Printf("[pbb] Extraction error: %v\n", err)
 				os.Remove(tmpFile)
 				continue
 			}
 
 			if err := saveManifest(pkgName, manifest); err != nil {
-				fmt.Printf("[pbb] Failed to finalize configuration file manifest output: %v\n", err)
+				fmt.Printf("[pbb] Failed to save manifest: %v\n", err)
 			}
 
-			registerPackage(pkgName, pkgVersion, branchName)
+			registerPackage(pkgName, pkgVersion, branchName, "repo")
 			os.Remove(tmpFile)
-			fmt.Printf("[+] Package '%s' successfully linked to environment prefix configuration location [%s].\n", pkgName, branchName)
+			fmt.Printf("[+] Package '%s' successfully installed [%s].\n", pkgName, branchName)
 		}
 
 	case "-R":
 		if len(packages) == 0 {
-			fmt.Println("[pbb] Error: No targets specified for deletion.")
+			fmt.Println("[pbb] Error: No targets specified for removal.")
 			os.Exit(1)
 		}
 		for _, pkg := range packages {
 			cleanPkgName := pkg
 			if strings.HasSuffix(cleanPkgName, ".pkg.tar.zst") {
-				cleanPkgName = strings.Split(cleanPkgName, "-")[0]
+				cleanPkgName = parsePkgNameFromFilename(cleanPkgName)
 			}
-
 			if err := removePackageWithManifest(cleanPkgName); err != nil {
-				fmt.Printf("[pbb] Deletion failure on target element '%s': %v\n", cleanPkgName, err)
+				fmt.Printf("[pbb] Removal failed for '%s': %v\n", cleanPkgName, err)
 			}
 		}
 
 	case "-Q":
 		db, err := readLocalDb()
 		if err != nil {
-			fmt.Printf("[pbb] Local database instance state recovery error: %v\n", err)
+			fmt.Printf("[pbb] Failed to read local database: %v\n", err)
 			os.Exit(1)
 		}
 
 		if len(packages) == 0 {
-			fmt.Println("[pbb] Tracked local system repository components info:")
+			fmt.Println("[pbb] Installed packages:")
 			for name, info := range db {
-				fmt.Printf("%s %s [%s]\n", name, info.Version, info.Branch)
+				fmt.Printf("  %s %s [%s] (%s)\n", name, info.Version, info.Branch, info.Source)
 			}
 		} else {
 			for _, pkgName := range packages {
 				info, exists := db[pkgName]
 				if exists {
-					fmt.Printf("%s %s [%s]\n", info.Name, info.Version, info.Branch)
+					fmt.Printf("%s %s [%s] (%s)\n", info.Name, info.Version, info.Branch, info.Source)
 				} else {
-					fmt.Printf("[pbb] Target instance element '%s' is not tracked in the current environment.\n", pkgName)
+					fmt.Printf("[pbb] Package '%s' is not installed.\n", pkgName)
 				}
 			}
 		}
 
 	case "-q":
 		if len(packages) == 0 {
-			fmt.Println("[pbb] Error: Missing query expression argument. Example usage: pbb -q python")
+			fmt.Println("[pbb] Error: Missing search term. Example: pbb -q python")
 			os.Exit(1)
 		}
 		searchTerm := packages[0]
-		fmt.Printf("[pbb] Querying index structures for matching patterns: '%s'...\n", searchTerm)
+		fmt.Printf("[pbb] Searching for '%s' in repository indexes...\n", searchTerm)
 		if err := searchPackagesGlobal(searchTerm); err != nil {
-			fmt.Printf("[pbb] Remote index file query loop returned an error: %v. Database refresh may be required (pbb -Syu)\n", err)
+			fmt.Printf("[pbb] Search error: %v. Try running pbb -Syu first.\n", err)
 		}
 
 	case "-AUR":
 		if len(packages) == 0 {
-			fmt.Println("[pbb] Error: Missing target search argument. Example usage: pbb -AUR telegram")
+			fmt.Println("[pbb] Error: Missing search term. Example: pbb -AUR telegram")
 			os.Exit(1)
 		}
 		searchTerm := packages[0]
 
-		fmt.Printf("[pbb] Scanning repository files for matching instances: '%s'...\n", searchTerm)
+		fmt.Printf("[pbb] Searching official repositories for '%s'...\n", searchTerm)
 		_ = searchPackagesGlobal(searchTerm)
 
-		fmt.Printf("\n[pbb] Contacting remote AUR server database backend endpoint...")
+		fmt.Printf("\n[pbb] Querying AUR for '%s'...\n", searchTerm)
 		if err := searchAur(searchTerm); err != nil {
-			fmt.Printf("\n[pbb] Remote database search request processing failure: %v\n", err)
+			fmt.Printf("[pbb] AUR query failed: %v\n", err)
 		}
 
 	case "-S-AUR":
 		if len(packages) == 0 {
-			fmt.Println("[pbb] Error: Target package definition parameter missing. Example usage: pbb -S-AUR ponysay-git")
+			fmt.Println("[pbb] Error: Missing package name. Example: pbb -S-AUR ponysay-git")
 			os.Exit(1)
 		}
 		pkgName := packages[0]
-		fmt.Printf("[pbb] Requesting source context snapshots mapping for element: %s\n", pkgName)
-		
+		fmt.Printf("[pbb] Fetching AUR snapshot for: %s\n", pkgName)
+
 		if err := downloadAndExtractAurSnapshot(pkgName); err != nil {
-			fmt.Printf("[pbb] Package directory retrieval processing failure: %v\n", err)
+			fmt.Printf("[pbb] Failed to fetch AUR snapshot: %v\n", err)
 			os.Exit(1)
 		}
 
 		buildDir := filepath.Join("/tmp", pkgName)
-		fmt.Printf("[pbb] Parsing build configuration targets in %s...\n", pkgName)
-		
+		fmt.Printf("[pbb] Parsing dependencies from PKGBUILD...\n")
+
 		deps, err := parseAurDependencies(buildDir)
 		if err != nil {
-			fmt.Printf("[pbb] Configuration parameters evaluation error inside package definition script: %v\n", err)
+			fmt.Printf("[pbb] Failed to parse PKGBUILD dependencies: %v\n", err)
 			os.Exit(1)
 		}
 
-		if err := CheckAndInstallDependencies(deps, currentMirror, branchName); err != nil {
-			fmt.Printf("[pbb] Critical dependency validation check error detected: %v\n", err)
+		// AUR dependencies go into AurTargetPrefix to stay isolated from repo packages
+		if err := CheckAndInstallDependencies(deps, currentMirror, branchName, AurTargetPrefix); err != nil {
+			fmt.Printf("[pbb] Dependency installation failed: %v\n", err)
 			os.Exit(1)
 		}
 
-		fmt.Println("\n[+] Verification sequence completed. Instantiating compilation framework process pipeline...")
-		
+		fmt.Println("\n[+] Dependencies satisfied. Starting build pipeline...")
+
 		pkgDir := filepath.Join("/tmp", "pbb-root-"+pkgName)
 		if err := os.MkdirAll(pkgDir, 0755); err != nil {
-			fmt.Printf("[pbb] Failed to construct runtime sandbox staging location directory structure: %v\n", err)
+			fmt.Printf("[pbb] Failed to create build staging directory: %v\n", err)
 			os.Exit(1)
 		}
 
-		fmt.Println("[pbb] Initializing build() and package() runtime hooks inside definition file context...")
+		fmt.Println("[pbb] Running build() and package() from PKGBUILD...")
 		if err := runAurBuildAndPackage(buildDir, pkgDir); err != nil {
-			fmt.Printf("[pbb] Compilation failure inside sandbox execution runtime pipeline: %v\n", err)
+			fmt.Printf("[pbb] Build failed: %v\n", err)
 			os.RemoveAll(pkgDir)
 			os.Exit(1)
 		}
 
-		fmt.Println("[pbb] Build pipeline finished. Relocating data objects into targeted structure mappings...")
-		manifest, err := deployBuiltFiles(pkgDir, TargetPrefix)
+		fmt.Println("[pbb] Build finished. Deploying files into AUR prefix...")
+		// AUR packages go into AurTargetPrefix with symlinks in AurBinSymlinkDir
+		manifest, err := deployBuiltFiles(pkgDir, AurTargetPrefix, AurBinSymlinkDir)
 		if err != nil {
-			fmt.Printf("[pbb] Failure inside deployment sequence tracker logic module: %v\n", err)
+			fmt.Printf("[pbb] Deployment failed: %v\n", err)
 			os.RemoveAll(pkgDir)
 			os.Exit(1)
 		}
 
 		if err := saveManifest(pkgName, manifest); err != nil {
-			fmt.Printf("[pbb] Manifest tracking log writing error: %v\n", err)
+			fmt.Printf("[pbb] Failed to save manifest: %v\n", err)
 		}
 
-		registerPackage(pkgName, "git-custom", branchName)
-		
+		registerPackage(pkgName, "git-custom", branchName, "aur")
+
 		os.RemoveAll(pkgDir)
 		os.RemoveAll(buildDir)
 
-		fmt.Printf("\n[+] AUR package targets component '%s' successfully built and linked inside local workspace environments!\n", pkgName)
-	
+		fmt.Printf("\n[+] AUR package '%s' successfully built and installed!\n", pkgName)
+		fmt.Printf("    Binaries available in: %s\n", AurBinSymlinkDir)
+
 	default:
-		if rollbackOpt {
-			if len(packages) == 0 {
-				fmt.Println("[pbb] Error: Missing rollback elements targets.")
-				os.Exit(1)
-			}
-			for _, pkg := range packages {
-				handleRollback(pkg, stableMirror)
-			}
-		} else {
-			printHelp()
-		}
+		printHelp()
 	}
 }

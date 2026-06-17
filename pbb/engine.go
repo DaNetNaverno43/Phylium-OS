@@ -16,6 +16,28 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// --- Package Name Utilities ---
+
+// parsePkgNameFromFilename extracts the package name from an Arch filename like:
+//   lib32-mesa-23.1.0-1-x86_64.pkg.tar.zst
+// The filename format is: <name>-<pkgver>-<pkgrel>-<arch>.pkg.tar.zst
+// We strip from the end: arch, pkgrel, pkgver — what remains is the name.
+// This correctly handles names with hyphens like "lib32-mesa" or "python-requests".
+func parsePkgNameFromFilename(filename string) string {
+	// Strip known suffixes
+	name := strings.TrimSuffix(filename, ".pkg.tar.zst")
+	name = strings.TrimSuffix(name, ".pkg.tar.xz")
+
+	parts := strings.Split(name, "-")
+	// Minimum valid: name-pkgver-pkgrel-arch → at least 4 parts
+	// Strip the last 3 (arch, pkgrel, pkgver) to get the package name.
+	if len(parts) >= 4 {
+		return strings.Join(parts[:len(parts)-3], "-")
+	}
+	// Fallback: just return the first segment
+	return parts[0]
+}
+
 // --- Arch Repository Database Parser ---
 
 func searchPackageInRepositories(targetPkg string) (repoName string, filename string, version string, err error) {
@@ -52,6 +74,8 @@ func searchPackageInRepositories(targetPkg string) (repoName string, filename st
 				continue
 			}
 
+			// Directory name format in .db is "<name>-<pkgver>-<pkgrel>".
+			// We need to extract just the package name (strip last two dash-separated segments).
 			fullDirName := parts[0]
 			var dashIndices []int
 			for i := 0; i < len(fullDirName); i++ {
@@ -78,10 +102,10 @@ func searchPackageInRepositories(targetPkg string) (repoName string, filename st
 				lines := strings.Split(buf.String(), "\n")
 				var tempFilename, tempVersion string
 				for i, line := range lines {
-					if line == "%FILENAME%" {
+					if line == "%FILENAME%" && i+1 < len(lines) {
 						tempFilename = lines[i+1]
 					}
-					if line == "%VERSION%" {
+					if line == "%VERSION%" && i+1 < len(lines) {
 						tempVersion = lines[i+1]
 					}
 				}
@@ -151,13 +175,13 @@ func searchPackagesGlobal(searchTerm string) error {
 					var pkgName, pkgVersion, pkgDesc string
 
 					for i, line := range lines {
-						if line == "%NAME%" {
+						if line == "%NAME%" && i+1 < len(lines) {
 							pkgName = lines[i+1]
 						}
-						if line == "%VERSION%" {
+						if line == "%VERSION%" && i+1 < len(lines) {
 							pkgVersion = lines[i+1]
 						}
-						if line == "%DESC%" {
+						if line == "%DESC%" && i+1 < len(lines) {
 							pkgDesc = lines[i+1]
 						}
 					}
@@ -209,7 +233,7 @@ func searchAur(searchTerm string) error {
 
 	var aurData AurResponse
 	if err := json.NewDecoder(resp.Body).Decode(&aurData); err != nil {
-		return fmt.Errorf("failed to parse AUR JSON payload: %v", err)
+		return fmt.Errorf("failed to parse AUR JSON response: %v", err)
 	}
 
 	if aurData.ResultCount == 0 {
@@ -263,13 +287,19 @@ func patchBinaryElf(targetPath string) {
 	_ = cmd.Run()
 }
 
-func createBinSymlink(targetPath string) string {
+// createBinSymlink creates a symlink from symlinkDir/basename -> targetPath.
+// symlinkDir is passed explicitly so repo and AUR packages use separate dirs.
+func createBinSymlink(targetPath, symlinkDir string) string {
 	fileName := filepath.Base(targetPath)
 	if strings.HasPrefix(fileName, ".") || strings.Contains(targetPath, "/usr/lib/") {
 		return ""
 	}
 
-	symlinkPath := filepath.Join(BinSymlinkDir, fileName)
+	if err := os.MkdirAll(symlinkDir, 0755); err != nil {
+		return ""
+	}
+
+	symlinkPath := filepath.Join(symlinkDir, fileName)
 	_ = os.Remove(symlinkPath)
 	if err := os.Symlink(targetPath, symlinkPath); err == nil {
 		return symlinkPath
@@ -277,7 +307,9 @@ func createBinSymlink(targetPath string) string {
 	return ""
 }
 
-func extractZstTar(archivePath, targetDir string) ([]string, error) {
+// extractZstTar extracts a .pkg.tar.zst archive into targetDir.
+// Binaries found in /bin/ or /sbin/ get patchelf treatment and a symlink in symlinkDir.
+func extractZstTar(archivePath, targetDir, symlinkDir string) ([]string, error) {
 	var fileList []string
 	file, err := os.Open(archivePath)
 	if err != nil {
@@ -301,6 +333,7 @@ func extractZstTar(archivePath, targetDir string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Skip package metadata entries (start with ".")
 		if strings.HasPrefix(header.Name, ".") {
 			continue
 		}
@@ -311,13 +344,19 @@ func extractZstTar(archivePath, targetDir string) ([]string, error) {
 		switch header.Typeflag {
 		case tar.TypeDir:
 			os.MkdirAll(target, 0755)
+
 		case tar.TypeReg:
-			os.MkdirAll(filepath.Dir(target), 0755)
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return nil, err
+			}
 			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR|os.O_TRUNC, header.FileInfo().Mode())
 			if err != nil {
 				return nil, err
 			}
-			io.Copy(outFile, tarReader)
+			if _, err := io.Copy(outFile, tarReader); err != nil {
+				outFile.Close()
+				return nil, err
+			}
 			outFile.Close()
 
 			isExecutable := (header.FileInfo().Mode() & 0111) != 0
@@ -327,7 +366,7 @@ func extractZstTar(archivePath, targetDir string) ([]string, error) {
 				patchBinaryElf(target)
 			}
 			if isExecutable && (strings.Contains(target, "/bin/") || strings.Contains(target, "/sbin/")) {
-				if sym := createBinSymlink(target); sym != "" {
+				if sym := createBinSymlink(target, symlinkDir); sym != "" {
 					fileList = append(fileList, sym)
 				}
 			}
@@ -335,6 +374,7 @@ func extractZstTar(archivePath, targetDir string) ([]string, error) {
 		case tar.TypeSymlink:
 			os.Remove(target)
 			linkName := header.Linkname
+			// Rewrite absolute symlinks to be relative to the targetDir prefix
 			if strings.HasPrefix(linkName, "/") {
 				linkName = filepath.Join(targetDir, linkName)
 			}
@@ -344,40 +384,56 @@ func extractZstTar(archivePath, targetDir string) ([]string, error) {
 	return fileList, nil
 }
 
+// removePackageWithManifest removes all files recorded in a package's manifest,
+// then cleans up empty parent directories, the manifest itself, and the db entry.
 func removePackageWithManifest(pkgName string) error {
 	manifestPath := filepath.Join(ManifestsDir, pkgName+".list")
 	data, err := os.ReadFile(manifestPath)
 	if os.IsNotExist(err) {
-		return fmt.Errorf("file manifest not found")
+		return fmt.Errorf("manifest not found for '%s' — is it installed?", pkgName)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read manifest: %v", err)
 	}
 
-	files := strings.Split(string(data), "\n")
+	files := strings.Split(strings.TrimSpace(string(data)), "\n")
+
+	// Remove in reverse order so files are deleted before their parent directories
 	for i := len(files) - 1; i >= 0; i-- {
-		file := strings.TrimSpace(files[i])
-		if file == "" || file == "/" {
+		f := strings.TrimSpace(files[i])
+		if f == "" || f == "/" {
 			continue
 		}
-		fi, err := os.Stat(file)
+
+		fi, err := os.Lstat(f) // Lstat so we handle symlinks correctly
 		if err != nil {
-			os.Remove(file)
+			// Already gone — not an error, keep going
 			continue
 		}
+
 		if fi.IsDir() {
-			os.Remove(file)
+			// Only remove the directory if it's empty; if other packages put files
+			// there we must not touch it
+			if err := os.Remove(f); err != nil && verbose {
+				fmt.Printf("[v] Skipping non-empty directory: %s\n", f)
+			}
 		} else {
-			os.Remove(file)
+			if err := os.Remove(f); err != nil && verbose {
+				fmt.Printf("[v] Failed to remove file: %s: %v\n", f, err)
+			}
 		}
 	}
+
 	os.Remove(manifestPath)
 	unregisterPackage(pkgName)
-	fmt.Printf("[+] Package '%s' successfully removed from the user environment.\n", pkgName)
+	fmt.Printf("[+] Package '%s' removed.\n", pkgName)
 	return nil
 }
 
-// --- System Directories & Meta ---
+// --- System Directories & State ---
 
 func initSystemDirs() error {
-	paths := []string{PbbDir, ManifestsDir, SyncDir, TargetPrefix, BinSymlinkDir}
+	paths := []string{PbbDir, ManifestsDir, SyncDir, TargetPrefix, AurTargetPrefix, BinSymlinkDir, AurBinSymlinkDir}
 	for _, p := range paths {
 		if err := os.MkdirAll(p, 0755); err != nil {
 			return err
@@ -422,19 +478,71 @@ func saveState(state PbbState) error {
 	return os.WriteFile(StateFilePath, data, 0644)
 }
 
-func handleRollback(pkgName string, stableMirror string) {
+// handleRollback re-downloads the package from the stable archive mirror,
+// replacing whatever bleeding-edge version is currently installed.
+func handleRollback(pkgName, stableMirror string) {
 	db, err := readLocalDb()
 	if err != nil {
+		fmt.Printf("[pbb] Failed to read local database: %v\n", err)
 		return
 	}
+
 	pkg, exists := db[pkgName]
-	if !exists || pkg.Branch != "bleeding" {
+	if !exists {
+		fmt.Printf("[pbb] Package '%s' is not installed.\n", pkgName)
 		return
 	}
-	pkg.Branch = "stable"
-	db[pkgName] = pkg
-	writeLocalDb(db)
+	if pkg.Branch != "bleeding" {
+		fmt.Printf("[pbb] Package '%s' is already on stable branch. Nothing to do.\n", pkgName)
+		return
+	}
+
+	fmt.Printf("[pbb] Rolling back '%s' from bleeding to stable...\n", pkgName)
+
+	// Find the stable version in the repo database
+	repoType, pkgFilename, pkgVersion, err := searchPackageInRepositories(pkgName)
+	if err != nil {
+		fmt.Printf("[pbb] Could not find '%s' in stable repositories: %v\n", pkgName, err)
+		return
+	}
+
+	url := fmt.Sprintf("%s/%s/os/x86_64/%s", stableMirror, repoType, pkgFilename)
+	tmpFile := filepath.Join("/tmp", pkgFilename)
+
+	if err := downloadFile(url, tmpFile); err != nil {
+		fmt.Printf("[pbb] Failed to download stable version of '%s': %v\n", pkgName, err)
+		return
+	}
+	defer os.Remove(tmpFile)
+
+	// Determine which prefix/symlink dir this package belongs to
+	targetPrefix := TargetPrefix
+	symlinkDir := BinSymlinkDir
+	if pkg.Source == "aur" {
+		targetPrefix = AurTargetPrefix
+		symlinkDir = AurBinSymlinkDir
+	}
+
+	// Remove old files before extracting the stable version
+	if err := removePackageWithManifest(pkgName); err != nil && verbose {
+		fmt.Printf("[v] Pre-rollback cleanup warning: %v\n", err)
+	}
+
+	manifest, err := extractZstTar(tmpFile, targetPrefix, symlinkDir)
+	if err != nil {
+		fmt.Printf("[pbb] Failed to extract stable package: %v\n", err)
+		return
+	}
+
+	if err := saveManifest(pkgName, manifest); err != nil {
+		fmt.Printf("[pbb] Failed to save manifest after rollback: %v\n", err)
+	}
+
+	registerPackage(pkgName, pkgVersion, "stable", pkg.Source)
+	fmt.Printf("[+] Package '%s' successfully rolled back to stable (%s).\n", pkgName, pkgVersion)
 }
+
+// --- Local Database ---
 
 func readLocalDb() (map[string]PackageInfo, error) {
 	file, err := os.ReadFile(LocalDbPath)
@@ -443,6 +551,9 @@ func readLocalDb() (map[string]PackageInfo, error) {
 	}
 	var db map[string]PackageInfo
 	json.Unmarshal(file, &db)
+	if db == nil {
+		db = make(map[string]PackageInfo)
+	}
 	return db, nil
 }
 
@@ -451,9 +562,9 @@ func writeLocalDb(db map[string]PackageInfo) error {
 	return os.WriteFile(LocalDbPath, data, 0644)
 }
 
-func registerPackage(name, version, branch string) error {
+func registerPackage(name, version, branch, source string) error {
 	db, _ := readLocalDb()
-	db[name] = PackageInfo{Name: name, Version: version, Branch: branch}
+	db[name] = PackageInfo{Name: name, Version: version, Branch: branch, Source: source}
 	return writeLocalDb(db)
 }
 
@@ -463,17 +574,7 @@ func unregisterPackage(name string) error {
 	return writeLocalDb(db)
 }
 
-func printHelp() {
-	fmt.Println("Usage: pbb <command> [flags] [packages]")
-	fmt.Println("\nCommands:")
-	fmt.Println("  -Syu                      Synchronize repository databases")
-	fmt.Println("  -S <package_name>         Install package")
-	fmt.Println("  -R <package_name>         Remove package")
-	fmt.Println("  -Q [package_name]         List installed packages")
-	fmt.Println("  -q <search_string>        Search package in official repositories")
-	fmt.Println("  -AUR <search_string>      Global search across official databases + AUR")
-	fmt.Println("  -S-AUR <package_name>     Download and extract AUR snapshot for compilation")
-}
+// --- AUR Build Pipeline ---
 
 func downloadAndExtractAurSnapshot(pkgName string) error {
 	url := fmt.Sprintf("https://aur.archlinux.org/rpc/?v=5&type=info&arg[]=%s", pkgName)
@@ -493,35 +594,34 @@ func downloadAndExtractAurSnapshot(pkgName string) error {
 
 	var aurData AurResponse
 	if err := json.NewDecoder(resp.Body).Decode(&aurData); err != nil {
-		return fmt.Errorf("failed to parse endpoint response: %v", err)
+		return fmt.Errorf("failed to parse AUR response: %v", err)
 	}
 
 	if aurData.ResultCount == 0 {
-		return fmt.Errorf("package '%s' not found in AUR database", pkgName)
+		return fmt.Errorf("package '%s' not found in AUR", pkgName)
 	}
 
 	targetPkg := aurData.Results[0]
 	if targetPkg.URLPath == "" {
-		return fmt.Errorf("AUR did not provide a snapshot link for %s", pkgName)
+		return fmt.Errorf("AUR did not return a snapshot URL for '%s'", pkgName)
 	}
 
 	snapshotURL := "https://aur.archlinux.org" + targetPkg.URLPath
 	archiveName := filepath.Base(targetPkg.URLPath)
 	tmpArchivePath := filepath.Join("/tmp", archiveName)
 
-	fmt.Printf("[pbb] Downloading snapshot from AUR: %s\n", snapshotURL)
+	fmt.Printf("[pbb] Downloading AUR snapshot: %s\n", snapshotURL)
 	if err := downloadFile(snapshotURL, tmpArchivePath); err != nil {
-		return fmt.Errorf("failed to download archive: %v", err)
+		return fmt.Errorf("failed to download snapshot: %v", err)
 	}
 	defer os.Remove(tmpArchivePath)
 
-	fmt.Printf("[pbb] Extracting snapshot to /tmp...\n")
+	fmt.Printf("[pbb] Extracting snapshot...\n")
 	if err := extractTarGz(tmpArchivePath, "/tmp"); err != nil {
-		return fmt.Errorf("failed to extract archive: %v", err)
+		return fmt.Errorf("failed to extract snapshot: %v", err)
 	}
 
-	buildDir := filepath.Join("/tmp", targetPkg.Name)
-	fmt.Printf("[+] Snapshot successfully prepared at: %s\n", buildDir)
+	fmt.Printf("[+] Snapshot ready at: %s\n", filepath.Join("/tmp", targetPkg.Name))
 	return nil
 }
 
@@ -577,15 +677,18 @@ func extractTarGz(archivePath, targetDir string) error {
 func parseAurDependencies(buildDir string) ([]string, error) {
 	pkgbuildPath := filepath.Join(buildDir, "PKGBUILD")
 	if _, err := os.Stat(pkgbuildPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("PKGBUILD file is missing in directory %s", buildDir)
+		return nil, fmt.Errorf("PKGBUILD not found in %s", buildDir)
 	}
 
+	// We source the PKGBUILD in bash to let it expand variables, arrays, etc.
+	// This is intentional — PKGBUILD is bash by spec and there is no portable
+	// alternative to evaluating it correctly without a bash interpreter.
 	script := fmt.Sprintf("source %s && echo ${depends[@]} ${makedepends[@]}", pkgbuildPath)
 	cmd := exec.Command("bash", "-c", script)
-	
+
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute Bash script: %v", err)
+		return nil, fmt.Errorf("failed to source PKGBUILD: %v", err)
 	}
 
 	rawDeps := strings.Fields(string(output))
@@ -606,21 +709,18 @@ func runAurBuildAndPackage(buildDir, pkgDir string) error {
 		return err
 	}
 
-	// Build script executing execution phase switches into $srcdir before build and package operations
 	script := fmt.Sprintf(`
+		set -e
 		cd "%s"
-		
-		# Load PKGBUILD context into bash environment
+
 		source PKGBUILD
-		
+
 		export pkgdir="%s"
 		export srcdir="%s"
-		
-		# Set standard compilation variables
 		export PREFIX="/usr"
 		export DESTDIR="%s"
 
-		# Intercept python setup.py executions to ensure isolation
+		# Redirect python setup.py installs into pkgdir for isolation
 		python() {
 			if [[ "$*" == *"setup.py install"* ]]; then
 				/usr/bin/python "$@" --root="$pkgdir"
@@ -630,59 +730,55 @@ func runAurBuildAndPackage(buildDir, pkgDir string) error {
 		}
 		export -f python
 
-		echo "[pbb-build] Processing sources..."
+		echo "[pbb-build] Fetching sources..."
 		mkdir -p "$srcdir"
-		
+
 		for src_item in "${source[@]}"; do
 			clean_url=$(echo "$src_item" | sed 's/.*:://')
 			if [[ "$clean_url" == git+* || "$clean_url" == *.git ]]; then
 				repo_url=$(echo "$clean_url" | sed 's/^git+//' | sed 's/#.*//')
 				repo_name=$(basename "$repo_url" .git)
-				echo "[pbb-build] Cloning git source: $repo_url"
+				echo "[pbb-build] Cloning: $repo_url"
 				if [ ! -d "$srcdir/$repo_name" ]; then
 					git clone "$repo_url" "$srcdir/$repo_name"
 				fi
 			elif [[ "$clean_url" == http://* || "$clean_url" == https://* ]]; then
 				filename=$(basename "$clean_url")
-				echo "[pbb-build] Downloading archive: $filename"
+				echo "[pbb-build] Downloading: $filename"
 				if [ ! -f "$srcdir/$filename" ]; then
 					curl -L "$clean_url" -o "$srcdir/$filename"
 				fi
-				echo "[pbb-build] Extracting $filename..."
+				echo "[pbb-build] Extracting: $filename"
 				if [[ "$filename" == *.tar.gz || "$filename" == *.tgz ]]; then
 					tar -xf "$srcdir/$filename" -C "$srcdir"
 				elif [[ "$filename" == *.tar.zst ]]; then
 					tar -I zstd -xf "$srcdir/$filename" -C "$srcdir"
 				elif [[ "$filename" == *.zip ]]; then
-					unzip -q -o "$srcdir/$filename" -D "$srcdir"
+					unzip -q -o "$srcdir/$filename" -d "$srcdir"
 				fi
 			fi
 		done
 
-		# Change directory into source directory for compilation stage
 		cd "$srcdir"
-		echo "[build] Running build function..."
+		echo "[pbb-build] Running build()..."
 		if declare -f build > /dev/null; then
 			build
 		else
-			echo "[build] build() function missing, skipping."
+			echo "[pbb-build] No build() function, skipping."
 		fi
 
-		# Reset workspace context to source directory for packaging stage
 		cd "$srcdir"
-		echo "[package] Running package function..."
+		echo "[pbb-build] Running package()..."
 		if declare -f package > /dev/null; then
 			package
 		else
-			echo "[pbb] CRITICAL ERROR: package() function is missing!"
+			echo "[pbb] CRITICAL: package() function is missing in PKGBUILD!"
 			exit 1
 		fi
 
-		echo "[pbb] Waiting for background compilation utilities to exit..."
-		while pgrep -P $$ > /dev/null; do
-			sleep 0.2
-		done
-		echo "[pbb] Compilation sequence completed successfully."
+		echo "[pbb-build] Waiting for background jobs..."
+		wait
+		echo "[pbb-build] Build completed."
 	`, buildDir, pkgDir, srcDir, pkgDir)
 
 	cmd := exec.Command("bash", "-c", script)
@@ -692,8 +788,10 @@ func runAurBuildAndPackage(buildDir, pkgDir string) error {
 	return cmd.Run()
 }
 
-// deployBuiltFiles transfers compiled structures into target directories and builds a file manifest
-func deployBuiltFiles(srcDir, destDir string) ([]string, error) {
+// deployBuiltFiles copies compiled files from srcDir into destDir, creates
+// binary symlinks in binSymlinkDir, and handles usr/share linking.
+// binSymlinkDir is passed explicitly so AUR packages use AurBinSymlinkDir.
+func deployBuiltFiles(srcDir, destDir, binSymlinkDir string) ([]string, error) {
 	var manifest []string
 
 	err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
@@ -712,76 +810,79 @@ func deployBuiltFiles(srcDir, destDir string) ([]string, error) {
 		targetPath := filepath.Join(destDir, relPath)
 
 		if info.IsDir() {
-			if err := os.MkdirAll(targetPath, 0755); err != nil {
-				return err
-			}
-		} else {
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-				return err
-			}
+			return os.MkdirAll(targetPath, 0755)
+		}
 
-			srcFile, err := os.Open(path)
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return err
+		}
+
+		srcFile, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer srcFile.Close()
+
+		destFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+		if err != nil {
+			return err
+		}
+		defer destFile.Close()
+
+		if _, err := io.Copy(destFile, srcFile); err != nil {
+			return err
+		}
+
+		manifest = append(manifest, targetPath)
+
+		// Create binary wrappers/symlinks for executables in usr/bin/
+		if strings.HasPrefix(relPath, "usr/bin/") {
+			parts := strings.Split(relPath, "/")
+			if len(parts) < 3 {
+				return nil
+			}
+			binName := parts[2]
+
+			if err := os.MkdirAll(binSymlinkDir, 0755); err != nil {
+				return err
+			}
+			wrapperPath := filepath.Join(binSymlinkDir, binName)
+			realTarget := filepath.Join(destDir, "usr", "bin", binName)
+
+			targetInfo, err := os.Stat(realTarget)
 			if err != nil {
-				return err
-			}
-			defer srcFile.Close()
-
-			destFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
-			if err != nil {
-				return err
-			}
-			defer destFile.Close()
-
-			if _, err := io.Copy(destFile, srcFile); err != nil {
-				return err
+				return nil
 			}
 
-			manifest = append(manifest, targetPath)
+			_ = os.Remove(wrapperPath)
 
-			// --- Setup environment binaries and launchers inside usr/bin ---
-			if strings.HasPrefix(relPath, "usr/bin/") {
-				parts := strings.Split(relPath, "/")
-				if len(parts) >= 3 {
-					binName := parts[2]
+			if targetInfo.IsDir() {
+				// Python package dir: find the actual entry point
+				var executableTarget string
+				sameNameExec := filepath.Join(realTarget, binName)
+				mainPyExec := filepath.Join(realTarget, "__main__.py")
 
-					_ = os.MkdirAll(BinSymlinkDir, 0755)
-					wrapperPath := filepath.Join(BinSymlinkDir, binName)
+				if fi, err := os.Stat(sameNameExec); err == nil && !fi.IsDir() {
+					executableTarget = sameNameExec
+				} else if fi, err := os.Stat(mainPyExec); err == nil && !fi.IsDir() {
+					executableTarget = mainPyExec
+				} else {
+					return nil
+				}
 
-					realTarget := filepath.Join(destDir, "usr", "bin", binName)
-					targetInfo, err := os.Stat(realTarget)
-
-					if err == nil {
-						_ = os.Remove(wrapperPath)
-
-						if targetInfo.IsDir() {
-							// Wrapper generation for packages containing script directories
-							var executableTarget string
-							sameNameExec := filepath.Join(realTarget, binName)
-							mainPyExec := filepath.Join(realTarget, "__main__.py")
-
-							if info, err := os.Stat(sameNameExec); err == nil && !info.IsDir() {
-								executableTarget = sameNameExec
-							} else if info, err := os.Stat(mainPyExec); err == nil && !info.IsDir() {
-								executableTarget = mainPyExec
-							} else {
-								return nil 
-							}
-
-							wrapperContent := fmt.Sprintf("#!/bin/sh\nexport PYTHONWARNINGS=ignore\nexec python3 \"%s\" \"$@\"\n", executableTarget)
-							if err := os.WriteFile(wrapperPath, []byte(wrapperContent), 0755); err == nil {
-								fmt.Printf("[pbb-deploy] Created directory wrapper script: %s -> %s\n", wrapperPath, executableTarget)
-								manifest = append(manifest, wrapperPath)
-							}
-						} else {
-							if err := os.Symlink(realTarget, wrapperPath); err == nil {
-								fmt.Printf("[pbb-deploy] Created binary symlink: %s -> %s\n", wrapperPath, realTarget)
-								manifest = append(manifest, wrapperPath)
-							}
-						}
-					}
+				wrapperContent := fmt.Sprintf("#!/bin/sh\nexport PYTHONWARNINGS=ignore\nexec python3 \"%s\" \"$@\"\n", executableTarget)
+				if err := os.WriteFile(wrapperPath, []byte(wrapperContent), 0755); err == nil {
+					fmt.Printf("[pbb-deploy] Wrapper script: %s -> %s\n", wrapperPath, executableTarget)
+					manifest = append(manifest, wrapperPath)
+				}
+			} else {
+				if err := os.Symlink(realTarget, wrapperPath); err == nil {
+					fmt.Printf("[pbb-deploy] Binary symlink: %s -> %s\n", wrapperPath, realTarget)
+					manifest = append(manifest, wrapperPath)
 				}
 			}
 		}
+
 		return nil
 	})
 
@@ -789,18 +890,19 @@ func deployBuiltFiles(srcDir, destDir string) ([]string, error) {
 		return nil, err
 	}
 
-	// --- Automate shared structures linking (usr/share) ---
+	// Link usr/share subdirectories into ~/.local/share (skip system-managed ones)
 	usrSharePath := filepath.Join(srcDir, "usr", "share")
 	if entries, err := os.ReadDir(usrSharePath); err == nil {
 		userShareDir := filepath.Join(os.Getenv("HOME"), ".local", "share")
 		_ = os.MkdirAll(userShareDir, 0755)
 
+		skipDirs := map[string]bool{
+			"licenses": true, "man": true, "doc": true, "info": true,
+			"bash-completion": true, "fish": true, "zsh": true, "applications": true,
+		}
+
 		for _, entry := range entries {
-			systemFolders := map[string]bool{
-				"licenses": true, "man": true, "doc": true, "info": true,
-				"bash-completion": true, "fish": true, "zsh": true, "applications": true,
-			}
-			if systemFolders[entry.Name()] {
+			if skipDirs[entry.Name()] {
 				continue
 			}
 
@@ -808,13 +910,31 @@ func deployBuiltFiles(srcDir, destDir string) ([]string, error) {
 			userDataSymlink := filepath.Join(userShareDir, entry.Name())
 
 			_ = os.Remove(userDataSymlink)
-
 			if err := os.Symlink(isolatedDataDir, userDataSymlink); err == nil {
-				fmt.Printf("[pbb-deploy] Integrated assets directory: %s -> %s\n", userDataSymlink, isolatedDataDir)
+				fmt.Printf("[pbb-deploy] Share symlink: %s -> %s\n", userDataSymlink, isolatedDataDir)
 				manifest = append(manifest, userDataSymlink)
 			}
 		}
 	}
 
 	return manifest, nil
+}
+
+func printHelp() {
+	fmt.Println("Usage: pbb <command> [flags] [packages]")
+	fmt.Println("\nCommands:")
+	fmt.Println("  -Syu                      Sync repository databases")
+	fmt.Println("  -S  <pkg>                 Install package from official repos")
+	fmt.Println("  -R  <pkg>                 Remove package")
+	fmt.Println("  -Q  [pkg]                 List installed packages")
+	fmt.Println("  -q  <term>                Search in official repos")
+	fmt.Println("  -AUR <term>               Search in official repos + AUR")
+	fmt.Println("  -S-AUR <pkg>              Build and install AUR package")
+	fmt.Println("\nFlags (combine with commands above):")
+	fmt.Println("  --bleeding                Use live Arch mirror instead of snapshot")
+	fmt.Println("  --rollback                Re-download package from stable snapshot mirror")
+	fmt.Println("  -v                        Verbose output")
+	fmt.Println("\nAUR packages are isolated in:")
+	fmt.Println("  Files:    ~/.local/share/pbb/aur-root/")
+	fmt.Println("  Binaries: ~/.local/bin/aur/  (add to PATH to use)")
 }
