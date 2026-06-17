@@ -1,0 +1,14 @@
+/home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/deps/serde-8ed62ae14b06b0c1.d: /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/build/serde-1e53b212c35f1d26/out/private.rs
+
+/home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/deps/libserde-8ed62ae14b06b0c1.rlib: /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/build/serde-1e53b212c35f1d26/out/private.rs
+
+/home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/deps/libserde-8ed62ae14b06b0c1.rmeta: /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/build/serde-1e53b212c35f1d26/out/private.rs
+
+/home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/f2stashke/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/build/serde-1e53b212c35f1d26/out/private.rs:
+
+# env-dep:OUT_DIR=/home/f2stashke/Documents/work/projects/RootlessOS/cogovinit/target/release/build/serde-1e53b212c35f1d26/out

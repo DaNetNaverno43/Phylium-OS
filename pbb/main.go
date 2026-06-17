@@ -22,6 +22,8 @@ var (
 	AurTargetPrefix  string // Root prefix for AUR packages (~/.local/share/pbb/aur-root)
 	BinSymlinkDir    string // Symlink dir for official repo binaries (~/.local/bin)
 	AurBinSymlinkDir string // Symlink dir for AUR binaries (~/.local/bin/aur)
+	InitdDir         string // cogovinit service configs (~/.local/share/pbb/system/init.d)
+	LogDir           string // service logs (~/.local/share/pbb/system/log)
 )
 
 const (
@@ -70,6 +72,9 @@ func init() {
 	AurTargetPrefix  = filepath.Join(BasePbbDir, "aur-root")
 	BinSymlinkDir    = filepath.Join(home, ".local", "bin")
 	AurBinSymlinkDir = filepath.Join(home, ".local", "bin", "aur")
+
+	InitdDir         = filepath.Join(PbbDir, "init.d")
+	LogDir           = filepath.Join(PbbDir, "log")
 
 	StateFilePath = filepath.Join(PbbDir, "state.json")
 	LocalDbPath   = filepath.Join(PbbDir, "local_db.json")
@@ -167,9 +172,9 @@ func main() {
 			}
 
 			fmt.Printf("[pbb] Searching for package '%s' in repository indexes...\n", pkgName)
-			repoType, pkgFilename, pkgVersion, err := searchPackageInRepositories(pkgName)
+			repoType, pkgFilename, pkgVersion, sha256sum, err := searchPackageInRepositories(pkgName)
 			if err != nil {
-				fmt.Printf("[pbb] Error matching target component: %v. Please execute pbb -Syu first\n", err)
+				fmt.Printf("[pbb] Package not found: %v. Run pbb -Syu first if databases are stale.\n", err)
 				continue
 			}
 
@@ -180,9 +185,15 @@ func main() {
 			url := fmt.Sprintf("%s/%s/os/x86_64/%s", currentMirror, repoType, pkgFilename)
 			fmt.Printf("[pbb] Downloading '%s' from [%s]...\n", pkgName, repoType)
 
-			tmpFile := filepath.Join("/tmp", pkgFilename)
-			if err := downloadFile(url, tmpFile); err != nil {
+			tmpFile, tmpDir, err := downloadToTempDir(url, pkgFilename)
+			if err != nil {
 				fmt.Printf("[pbb] Download failed: %v\n", err)
+				continue
+			}
+
+			if err := verifySHA256(tmpFile, sha256sum); err != nil {
+				fmt.Printf("[pbb] Checksum verification failed for '%s': %v\n", pkgName, err)
+				os.RemoveAll(tmpDir)
 				continue
 			}
 
@@ -191,9 +202,9 @@ func main() {
 			}
 
 			manifest, err := extractZstTar(tmpFile, TargetPrefix, BinSymlinkDir)
+			os.RemoveAll(tmpDir)
 			if err != nil {
-				fmt.Printf("[pbb] Extraction error: %v\n", err)
-				os.Remove(tmpFile)
+				fmt.Printf("[pbb] Extraction failed: %v\n", err)
 				continue
 			}
 
@@ -201,9 +212,10 @@ func main() {
 				fmt.Printf("[pbb] Failed to save manifest: %v\n", err)
 			}
 
-			registerPackage(pkgName, pkgVersion, branchName, "repo")
-			os.Remove(tmpFile)
-			fmt.Printf("[+] Package '%s' successfully installed [%s].\n", pkgName, branchName)
+			if err := registerPackage(pkgName, pkgVersion, branchName, "repo"); err != nil {
+				fmt.Printf("[pbb] Failed to register package in database: %v\n", err)
+			}
+			fmt.Printf("[+] Package '%s' installed [%s].\n", pkgName, branchName)
 		}
 
 	case "-R":
@@ -326,7 +338,13 @@ func main() {
 			fmt.Printf("[pbb] Failed to save manifest: %v\n", err)
 		}
 
-		registerPackage(pkgName, "git-custom", branchName, "aur")
+		if err := registerPackage(pkgName, "git-custom", branchName, "aur"); err != nil {
+			fmt.Printf("[pbb] Failed to register package in database: %v\n", err)
+		}
+
+		// Scan the built package for systemd units and convert them to
+		// cogovinit .toml configs in InitdDir. Non-fatal — runs before cleanup.
+		interceptAndRegisterServices(pkgName, pkgDir)
 
 		os.RemoveAll(pkgDir)
 		os.RemoveAll(buildDir)

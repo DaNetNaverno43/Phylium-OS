@@ -1,0 +1,13 @@
+[package]
+name = "cogovinit"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cogovinit"
+path = "src/main.rs"
+
+[dependencies]
+toml      = "0.8"
+serde     = { version = "1", features = ["derive"] }
+nix       = { version = "0.27", features = ["user", "process", "signal", "sched"] }
